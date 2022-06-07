@@ -2,10 +2,13 @@ package journal_ring
 
 import (
 	"bytes"
+	"github.com/ii64/gouring"
+	"github.com/ii64/gouring/queue"
 	"golang.org/x/sys/unix"
 	"journal-ring/field"
 	"journal-ring/priority"
 	"strconv"
+	"time"
 )
 
 // https://lists.freedesktop.org/archives/systemd-devel/2012-November/007359.html
@@ -14,7 +17,9 @@ type Journal struct {
 	//used for SYSLOG_IDENTIFIER
 	//see also https://linux.die.net/man/3/program_invocation_short_name
 	tag      string
-	socketFD int
+	socketFD int32
+	ring     *gouring.Ring
+	q        *queue.Queue
 }
 
 /*
@@ -28,21 +33,22 @@ func Open(tag string) (*Journal, error) {
 		return nil, err
 	} else if err := unix.Connect(socketFD, &unix.SockaddrUnix{Name: "/run/systemd/journal/socket"}); err != nil {
 		return nil, err
+	} else if ring, err := gouring.New(256, nil); err != nil {
+		return nil, err
 	} else {
-		return &Journal{tag: tag, socketFD: socketFD}, nil
+		q := queue.New(ring)
+		go func() {
+			q.Run(true, func(cqe *gouring.CQEntry) error {
+				print("completed")
+				return nil
+			})
+		}()
+		return &Journal{tag: tag, socketFD: int32(socketFD), ring: ring, q: q}, nil
 	}
 }
 
-/*
-else if ring, err := gouring.New(256, nil); err != nil {
-		return err
-	} else {
-		defer ring.Close()
-	}
-*/
-
-func (journal *Journal) l(priority priority.SysLogLevel, message string) {
-	journal.log(CreateRecord(priority, message, ""))
+func (journal *Journal) l(priority priority.SysLogLevel, timestamp time.Time, message string) {
+	journal.log(CreateRecord(priority, timestamp, message, "")) // create MessageID
 }
 
 func (journal *Journal) log(record *Record) {
@@ -52,6 +58,7 @@ func (journal *Journal) log(record *Record) {
 	var buffer bytes.Buffer
 	write(&buffer, field.SyslogIdentifier, journal.tag)
 	write(&buffer, field.Priority, strconv.Itoa(int(record.priority)))
+	//TODO write timestamp
 	write(&buffer, field.Message, record.message)
 	write(&buffer, field.MessageID, string(record.messageId))
 	if record.fields != nil {
@@ -59,9 +66,18 @@ func (journal *Journal) log(record *Record) {
 			write(&buffer, key, value)
 		}
 	}
-	_, err := unix.Write(journal.socketFD, buffer.Bytes())
-	if err != nil {
+	bytes := buffer.Bytes()
+	sqe := journal.q.GetSQEntry()
+	sqe.UserData = 0 // identifier / event id
+	sqe.Opcode = gouring.IORING_OP_WRITE
+	sqe.Fd = journal.socketFD
+	sqe.Len = uint32(len(bytes))
+	sqe.SetOffset(0)
+	sqe.SetAddr(&bytes[0])
+	if submitted, err := journal.q.Submit(); err != nil {
 		panic("Error logging " + err.Error()) //TODO better error handling? returning the error pollutes business code *argl*
+	} else {
+		print("Submitted: ", submitted)
 	}
 }
 
@@ -76,13 +92,14 @@ func write(buffer *bytes.Buffer, fieldName field.Field, value string) {
 
 type Record struct {
 	priority  priority.SysLogLevel
+	timestamp time.Time
 	message   string
 	messageId MessageID
 	fields    map[field.Field]string
 }
 
-func CreateRecord(priority priority.SysLogLevel, message string, messageId MessageID) *Record {
-	return &Record{priority: priority, message: message, messageId: messageId}
+func CreateRecord(priority priority.SysLogLevel, timestamp time.Time, message string, messageId MessageID) *Record {
+	return &Record{priority: priority, timestamp: timestamp, message: message, messageId: messageId}
 }
 
 // TODO add method for map[field.Field]string and map[string]string and maybe some interface to prevent copy
@@ -92,4 +109,8 @@ func (record *Record) With(key field.Field, value string) *Record {
 	}
 	record.fields[key] = value
 	return record
+}
+
+func (journal *Journal) Close() error {
+	return journal.ring.Close()
 }
